@@ -47,12 +47,13 @@ jobs:
           $path = "project/lazarus/Lazarus%20Windows%2032%20bits/Lazarus%20$env:LAZ_VERSION/$file"
           # downloads.sourceforge.net is behind a Cloudflare challenge for scripted
           # clients; the per-mirror *.dl.sourceforge.net hosts serve the file directly.
+          # ${path} braces are required so the '?' starts the query, not the var name.
+          # master.dl serves the binary directly; others are fallbacks (the size
+          # check below rejects any that answer with an HTML stub).
           $mirrors = @(
-            "https://master.dl.sourceforge.net/$path?viasf=1",
-            "https://netix.dl.sourceforge.net/$path?viasf=1",
-            "https://phoenixnap.dl.sourceforge.net/$path?viasf=1",
-            "https://gigenet.dl.sourceforge.net/$path?viasf=1",
-            "https://netcologne.dl.sourceforge.net/$path?viasf=1"
+            "https://master.dl.sourceforge.net/${path}?viasf=1",
+            "https://phoenixnap.dl.sourceforge.net/${path}?viasf=1",
+            "https://gigenet.dl.sourceforge.net/${path}?viasf=1"
           )
           $exe = Join-Path $env:RUNNER_TEMP "lazarus-setup.exe"
           $ok = $false
