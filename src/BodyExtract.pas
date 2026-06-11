@@ -2,16 +2,16 @@ unit BodyExtract;
 
 {
   Port of the relevant part of app/parser.py (_extract_base64), extended to
-  batch.
+  batch and to preserving non-wrapped text.
 
-  Given the text of a single editor window, locate the base64 wrap body of
-  *every* wrapped object present. Handles the common shapes (full
-  CREATE ... WRAPPED DDL and a bare body) by scanning for the 10g+ "a000000"
-  marker, then the content-length line, then the base64 payload lines.
+  Given the text of an editor window, locate every wrapped object's base64 body
+  AND its line span, so the caller can replace each wrapped block in place with
+  its unwrapped source while leaving non-wrapped statements untouched — e.g. a
+  plain package spec sitting next to a wrapped body, or vice versa. Nothing is
+  dropped.
 
-  Multiple objects in one window (a package spec + body, or several procedures)
-  are all returned, so none is dropped silently. ExtractBody returns just the
-  first body for callers (and tests) that handle a single object.
+  Shapes handled: full CREATE ... WRAPPED DDL and a bare body, located by the
+  10g+ "a000000" marker, then the content-length line, then the base64 lines.
 
   DBMS_METADATA quoting and the add-CREATE-OR-REPLACE option are deferred to v2.
 }
@@ -21,10 +21,25 @@ unit BodyExtract;
 interface
 
 uses
-  Classes,     // TStringList (return type of ExtractBodies)
+  Classes,     // TStringList
   UnwrapCore;  // EUnwrapError / TUnwrapErrorKind
 
-{ All base64 wrap bodies found in Text, one entry per wrapped object. Raises
+type
+  { One wrapped object located in the input: the inclusive line range to replace
+    (its CREATE..WRAPPED header line through the last base64 line) and the base64
+    body to decode. }
+  TWrapRegion = record
+    HeadLine: Integer;
+    LastLine: Integer;
+    Body: AnsiString;
+  end;
+  TWrapRegionArray = array of TWrapRegion;
+
+{ Every wrapped object found in Lines, in order. Raises EUnwrapError when
+  nothing wrapped is present. Line indices refer to the passed-in Lines. }
+function FindWrapRegions(Lines: TStringList): TWrapRegionArray;
+
+{ All base64 wrap bodies in Text, one entry per wrapped object. Raises
   EUnwrapError when nothing wrapped is present. The caller owns the list. }
 function ExtractBodies(const Text: AnsiString): TStringList;
 
@@ -104,98 +119,128 @@ begin
   Result := False;
 end;
 
-{ Collect the base64 body of the wrapped block whose 'a000000' marker sits on
-  line AIdx. Returns '' if this block has no usable length line / body (e.g. the
-  next block's marker is reached first). }
-function ExtractOne(Lines: TStringList; AIdx: Integer): AnsiString;
+{ Walk back from the 'a000000' marker to the object's CREATE...WRAPPED header
+  line (a single line ending with the WRAPPED keyword) so it is replaced along
+  with the body. Returns AIdx itself for a bare body with no such header. }
+function FindHeaderStart(Lines: TStringList; AIdx: Integer): Integer;
 var
-  LenIdx, I: Integer;
-  S, Parts: AnsiString;
-  HavePart: Boolean;
+  I: Integer;
+  S: AnsiString;
 begin
-  Result := '';
+  Result := AIdx;
+  I := AIdx - 1;
+  while (I >= 0) and (Trim(Lines[I]) = '') do
+    Dec(I);
+  if I < 0 then
+    Exit;
+  S := LowerCase(Trim(Lines[I]));
+  if (Length(S) >= 7) and (Copy(S, Length(S) - 6, 7) = 'wrapped') then
+    Result := I;
+end;
 
-  LenIdx := -1;
-  for I := AIdx + 1 to Lines.Count - 1 do
+function FindWrapRegions(Lines: TStringList): TWrapRegionArray;
+var
+  I, J, LenIdx, LastB64, Count: Integer;
+  S, Parts: AnsiString;
+  HavePart, SawMarker: Boolean;
+begin
+  SetLength(Result, 0);
+  Count := 0;
+  SawMarker := False;
+
+  I := 0;
+  while I < Lines.Count do
   begin
     if LowerCase(Trim(Lines[I])) = A000_MARKER then
-      Exit;  // next block begins before a length line — this one is empty
-    if IsLenLine(Lines[I]) then
     begin
-      LenIdx := I;
-      Break;
-    end;
-  end;
-  if LenIdx < 0 then
-    Exit;
+      SawMarker := True;
 
-  Parts := '';
-  HavePart := False;
-  for I := LenIdx + 1 to Lines.Count - 1 do
-  begin
-    S := Trim(Lines[I]);
-    if S = '' then
-    begin
-      if HavePart then
-        Break
-      else
-        Continue;
+      // The content-length line for this block (stop if the next block starts).
+      LenIdx := -1;
+      for J := I + 1 to Lines.Count - 1 do
+      begin
+        if LowerCase(Trim(Lines[J])) = A000_MARKER then
+          Break;
+        if IsLenLine(Lines[J]) then
+        begin
+          LenIdx := J;
+          Break;
+        end;
+      end;
+
+      if LenIdx >= 0 then
+      begin
+        Parts := '';
+        HavePart := False;
+        LastB64 := LenIdx;
+        for J := LenIdx + 1 to Lines.Count - 1 do
+        begin
+          S := Trim(Lines[J]);
+          if S = '' then
+          begin
+            if HavePart then
+              Break
+            else
+              Continue;
+          end;
+          if S = '/' then
+            Break;
+          if LowerCase(S) = A000_MARKER then
+            Break;  // the next block starts here
+          if IsB64Line(S) then
+          begin
+            Parts := Parts + S;
+            HavePart := True;
+            LastB64 := J;
+          end
+          else
+            Break;
+        end;
+
+        if HavePart then
+        begin
+          SetLength(Result, Count + 1);
+          Result[Count].HeadLine := FindHeaderStart(Lines, I);
+          Result[Count].LastLine := LastB64;
+          Result[Count].Body := Parts;
+          Inc(Count);
+        end;
+      end;
     end;
-    if S = '/' then
-      Break;
-    if LowerCase(S) = A000_MARKER then
-      Break;  // the next block starts here
-    if IsB64Line(S) then
+    Inc(I);
+  end;
+
+  if Count = 0 then
+  begin
+    if not SawMarker then
     begin
-      Parts := Parts + S;
-      HavePart := True;
+      if ContainsWrapped(Lines) then
+        raise EUnwrapError.CreateKind(uekLegacy,
+          'no ''a000000'' marker found — this looks like the pre-10g (9i) ' +
+          'wrap format, which is not supported')
+      else
+        raise EUnwrapError.CreateKind(uekNotWrapped, 'no wrapped body found');
     end
     else
-      Break;
+      raise EUnwrapError.CreateKind(uekMalformed,
+        'a wrapped marker was found but no base64 body could be extracted');
   end;
-
-  if HavePart then
-    Result := Parts;
 end;
 
 function ExtractBodies(const Text: AnsiString): TStringList;
 var
   Lines: TStringList;
-  I: Integer;
-  Body: AnsiString;
-  SawMarker: Boolean;
+  Regions: TWrapRegionArray;
+  K: Integer;
 begin
   Result := TStringList.Create;
   try
     Lines := TStringList.Create;
     try
       Lines.Text := Text;
-      SawMarker := False;
-
-      for I := 0 to Lines.Count - 1 do
-        if LowerCase(Trim(Lines[I])) = A000_MARKER then
-        begin
-          SawMarker := True;
-          Body := ExtractOne(Lines, I);
-          if Body <> '' then
-            Result.Add(Body);
-        end;
-
-      if Result.Count = 0 then
-      begin
-        if not SawMarker then
-        begin
-          if ContainsWrapped(Lines) then
-            raise EUnwrapError.CreateKind(uekLegacy,
-              'no ''a000000'' marker found — this looks like the pre-10g (9i) ' +
-              'wrap format, which is not supported')
-          else
-            raise EUnwrapError.CreateKind(uekNotWrapped, 'no wrapped body found');
-        end
-        else
-          raise EUnwrapError.CreateKind(uekMalformed,
-            'a wrapped marker was found but no base64 body could be extracted');
-      end;
+      Regions := FindWrapRegions(Lines);   // raises if nothing wrapped
+      for K := 0 to High(Regions) do
+        Result.Add(Regions[K].Body);
     finally
       Lines.Free;
     end;

@@ -66,15 +66,18 @@ const
     + 'page and were shown as "?". The source likely uses a database character '
     + 'set wider than this Windows code page.';
 
-{ Decode every wrapped object in the active window into one new SQL window.
-  One object''s failure never blocks the others — it becomes an inline comment,
-  so nothing is dropped silently. }
+{ Replace every wrapped object in the active window with its unwrapped source,
+  in place, leaving all non-wrapped text untouched — a plain package spec next
+  to a wrapped body (or vice versa) is preserved verbatim, so nothing is lost.
+  The whole transformed text goes to one new SQL window. A failed object becomes
+  an inline comment where its block was, and never blocks the rest. }
 procedure DoUnwrap;
 var
   Src, Decoded, Output, Msg: AnsiString;
-  Bodies: TStringList;
+  Lines: TStringList;
+  Regions: TWrapRegionArray;
   Sha1Ok, Lossy, AnyLossy: Boolean;
-  I, OkCount, FailCount: Integer;
+  I, R, OkCount, FailCount: Integer;
 begin
   if (not Assigned(IDE_GetText)) or (not Assigned(IDE_CreateWindow)) then
   begin
@@ -89,54 +92,39 @@ begin
     Exit;
   end;
 
+  Lines := TStringList.Create;
   try
-    Bodies := ExtractBodies(Src);
-  except
-    on E: EUnwrapError do
-    begin
-      MsgBox(E.Message, MB_ICONWARNING);
-      Exit;
-    end;
-    on E: Exception do
-    begin
-      MsgBox('Unexpected error: ' + E.Message, MB_ICONERROR);
-      Exit;
-    end;
-  end;
+    Lines.Text := Src;
 
-  try
-    if Bodies.Count = 1 then
-    begin
-      // Single object: keep the original UX — a failure is reported in a dialog
-      // and nothing is opened.
-      try
-        Decoded := DecodeBody(Bodies[0], True, Sha1Ok, Lossy);
-        IDE_CreateWindow(WT_SQL, PAnsiChar(Decoded), LongBool(False));
-        if Lossy then
-          MsgBox('Unwrapped, but with a caveat: ' + LOSSY_NOTE, MB_ICONWARNING);
-      except
-        on E: EUnwrapError do
-          MsgBox(E.Message, MB_ICONWARNING);
-        on E: Exception do
-          MsgBox('Unexpected error: ' + E.Message, MB_ICONERROR);
-      end;
-    end
-    else
-    begin
-      // Multiple objects: unwrap every one into a single new window. Each one is
-      // labelled; a failure becomes an inline SQL comment rather than aborting.
-      Output := '';
-      OkCount := 0;
-      FailCount := 0;
-      AnyLossy := False;
-      for I := 0 to Bodies.Count - 1 do
+    try
+      Regions := FindWrapRegions(Lines);
+    except
+      on E: EUnwrapError do
       begin
-        if I > 0 then
-          Output := Output + LineEnding + LineEnding;
-        Output := Output + Format('-- ===== Object %d of %d =====',
-          [I + 1, Bodies.Count]) + LineEnding;
+        MsgBox(E.Message, MB_ICONWARNING);
+        Exit;
+      end;
+      on E: Exception do
+      begin
+        MsgBox('Unexpected error: ' + E.Message, MB_ICONERROR);
+        Exit;
+      end;
+    end;
+
+    // Rebuild the window text: emit each line verbatim, except that a wrapped
+    // block (header..last base64 line) is swapped for its unwrapped source.
+    Output := '';
+    OkCount := 0;
+    FailCount := 0;
+    AnyLossy := False;
+    R := 0;
+    I := 0;
+    while I < Lines.Count do
+    begin
+      if (R <= High(Regions)) and (I = Regions[R].HeadLine) then
+      begin
         try
-          Decoded := DecodeBody(Bodies[I], True, Sha1Ok, Lossy);
+          Decoded := DecodeBody(Regions[R].Body, True, Sha1Ok, Lossy);
           Output := Output + Decoded;
           AnyLossy := AnyLossy or Lossy;
           Inc(OkCount);
@@ -152,23 +140,34 @@ begin
             Inc(FailCount);
           end;
         end;
-      end;
-
-      IDE_CreateWindow(WT_SQL, PAnsiChar(Output), LongBool(False));
-
-      if (FailCount > 0) or AnyLossy then
+        I := Regions[R].LastLine + 1;   // skip the consumed wrapped block
+        Inc(R);
+        if I < Lines.Count then
+          Output := Output + LineEnding;
+      end
+      else
       begin
-        Msg := Format('%d of %d objects unwrapped, %d failed.',
-          [OkCount, Bodies.Count, FailCount]);
-        if FailCount > 0 then
-          Msg := Msg + ' Failures are shown as comments in the new window.';
-        if AnyLossy then
-          Msg := Msg + ' ' + LOSSY_NOTE;
-        MsgBox(Msg, MB_ICONWARNING);
+        Output := Output + Lines[I];
+        if I < Lines.Count - 1 then
+          Output := Output + LineEnding;
+        Inc(I);
       end;
     end;
+
+    IDE_CreateWindow(WT_SQL, PAnsiChar(Output), LongBool(False));
+
+    if (FailCount > 0) or AnyLossy then
+    begin
+      Msg := Format('%d of %d wrapped object(s) unwrapped, %d failed.',
+        [OkCount, Length(Regions), FailCount]);
+      if FailCount > 0 then
+        Msg := Msg + ' Failures are shown as comments in the new window.';
+      if AnyLossy then
+        Msg := Msg + ' ' + LOSSY_NOTE;
+      MsgBox(Msg, MB_ICONWARNING);
+    end;
   finally
-    Bodies.Free;
+    Lines.Free;
   end;
 end;
 

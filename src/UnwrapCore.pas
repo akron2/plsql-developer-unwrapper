@@ -13,7 +13,8 @@ unit UnwrapCore;
       -> optional SHA-1 integrity check
       -> zlib inflate
       -> strip the single trailing NUL byte that wrap appends
-      -> decode bytes to text (utf-8 -> system ANSI; else pass-through)
+      -> decode bytes to text (infer source charset: utf-8, else the most
+         Russian-looking single-byte Cyrillic code page) -> host ANSI
 
   Wrap is obfuscation, not encryption. No database, no network.
   CHARMAP is generated from app/unwrap.py by plugin/tools/gen_charmap.py;
@@ -48,6 +49,11 @@ function DecodeBody(const B64Body: AnsiString; Verify: Boolean;
   out Sha1Ok: Boolean; out Lossy: Boolean): AnsiString; overload;
 function DecodeBody(const B64Body: AnsiString; Verify: Boolean;
   out Sha1Ok: Boolean): AnsiString; overload;
+
+{ The Windows code page inferred for raw (decompressed) source bytes: CP_UTF8
+  (65001) when valid UTF-8, one of the Cyrillic code pages when the bytes look
+  like Russian, or 0 when undetermined. Exposed for tests. }
+function InferSourceCodePage(const Data: AnsiString): Cardinal;
 
 implementation
 
@@ -117,15 +123,101 @@ begin
   Result := True;
 end;
 
-{ Decode source bytes, tolerating non-UTF-8 database character sets, and report
-  whether the conversion lost any character.
+const
+  CP_CP1251    = 1251;
+  CP_ISO8859_5 = 28595;
+  CP_KOI8R     = 20866;
+  CP_CP866     = 866;
 
-  Mirrors Python's utf-8 -> cp1251 -> latin-1 chain for an ANSI host: valid
-  UTF-8 is converted to the host ANSI code page (cp1251 on a Russian Windows)
-  explicitly through the Win32 API — deterministic and independent of the FPC
-  widestring manager that Utf8ToAnsi would otherwise rely on (whose state in a
-  DLL is fragile and could mangle Cyrillic). Non-UTF-8 bytes are already in an
-  8-bit code page and pass through unchanged (the lossless last resort).
+  // Relative frequencies of Russian letters а..я (index = code point - $0430),
+  // mirrored verbatim from app/unwrap.py _RU_FREQ. Drives the source-charset
+  // guess: real Russian scores high, code-page gibberish scores low.
+  RU_WEIGHT: array[0..31] of Integer = (
+     80,  16,  45,  17,  30,  85,   9,  16,  74,  12,  35,  44,  32,  67, 110,  28,
+     47,  55,  63,  26,   2,  10,   5,  14,   7,   4,   1,  19,  17,   3,   6,  20
+  );
+
+  // Candidate single-byte Cyrillic code pages, in the same order as the core.
+  CYR_CODEPAGES: array[0..3] of Cardinal =
+    (CP_CP1251, CP_ISO8859_5, CP_KOI8R, CP_CP866);
+
+{ Heuristic: higher when the text reads like real Russian, not gibberish.
+  Mirrors app/unwrap.py _russian_score. }
+function RussianScore(const W: UnicodeString): Integer;
+var
+  I, Code, Low: Integer;
+begin
+  Result := 0;
+  for I := 1 to Length(W) do
+  begin
+    Code := Ord(W[I]);
+    if (Code >= $0410) and (Code <= $042F) then
+      Low := Code + $20          // А..Я -> а..я
+    else if Code = $0401 then
+      Low := $0451               // Ё -> ё
+    else
+      Low := Code;
+    if (Low >= $0430) and (Low <= $044F) then
+      Inc(Result, RU_WEIGHT[Low - $0430])
+    else if Low = $0451 then
+      Inc(Result, 1)             // ё
+    else if (Code >= $0400) and (Code <= $04FF) then
+      Dec(Result, 5)             // Cyrillic block, but not a common Russian letter
+    else if Code < $80 then
+      Continue                   // ASCII: shared by all code pages, no signal
+    else
+      Dec(Result, 30);           // symbols/controls -> almost certainly wrong page
+  end;
+end;
+
+{ Decode Data from a given code page to UTF-16 (never fails for single-byte
+  pages; returns '' only on an empty input or an API error). }
+function WidenFrom(const Data: AnsiString; CodePage: Cardinal): UnicodeString;
+var
+  WideLen: Integer;
+begin
+  Result := '';
+  if Length(Data) = 0 then
+    Exit;
+  WideLen := MultiByteToWideChar(CodePage, 0, PAnsiChar(Data), Length(Data), nil, 0);
+  if WideLen <= 0 then
+    Exit;
+  SetLength(Result, WideLen);
+  MultiByteToWideChar(CodePage, 0, PAnsiChar(Data), Length(Data),
+    PWideChar(Result), WideLen);
+end;
+
+function InferSourceCodePage(const Data: AnsiString): Cardinal;
+var
+  I, Score, BestScore: Integer;
+begin
+  if Length(Data) = 0 then
+    Exit(CP_UTF8);                 // empty / ASCII: UTF-8 is the safe identity
+  if IsValidUtf8(Data) then
+    Exit(CP_UTF8);                 // AL32UTF8 source
+
+  Result := 0;                     // 0 = undetermined -> caller passes bytes through
+  BestScore := 0;                  // a candidate must look positively Russian to win
+  for I := Low(CYR_CODEPAGES) to High(CYR_CODEPAGES) do
+  begin
+    Score := RussianScore(WidenFrom(Data, CYR_CODEPAGES[I]));
+    if Score > BestScore then
+    begin
+      BestScore := Score;
+      Result := CYR_CODEPAGES[I];
+    end;
+  end;
+end;
+
+{ Decode source bytes to text by inferring the database character set, and
+  report whether the final conversion to the host code page lost any character.
+
+  Mirrors app/unwrap.py: UTF-8 first, otherwise the most Russian-looking
+  single-byte Cyrillic code page; when nothing looks Russian, the 8-bit bytes
+  are passed through unchanged (the lossless last resort). The recovered Unicode
+  is then encoded to the host ANSI code page (CP_ACP, cp1251 on a Russian
+  Windows) for the char*-based plug-in API, via the Win32 API so the result is
+  deterministic and independent of the FPC widestring manager.
 
   Lossy is set when a character had no representation in the host code page and
   was replaced with '?'. That cannot be avoided here (the plug-in API hands the
@@ -133,33 +225,31 @@ end;
 function DecodeText(const Data: AnsiString; out Lossy: Boolean): AnsiString;
 var
   Wide: UnicodeString;
-  WideLen, AnsiLen: Integer;
+  CodePage: Cardinal;
+  AnsiLen: Integer;
   UsedDefault: LongBool;
 begin
   Lossy := False;
   if Length(Data) = 0 then
     Exit('');
 
-  if not IsValidUtf8(Data) then
+  CodePage := InferSourceCodePage(Data);
+  if CodePage = 0 then
   begin
-    // Already an 8-bit DB code page (e.g. CL8MSWIN1251) — pass through, lossless.
+    // Not UTF-8 and nothing looked Russian: leave the 8-bit bytes as-is.
     Result := Data;
     Exit;
   end;
 
-  // UTF-8 -> UTF-16.
-  WideLen := MultiByteToWideChar(CP_UTF8, 0, PAnsiChar(Data), Length(Data), nil, 0);
-  if WideLen <= 0 then
+  Wide := WidenFrom(Data, CodePage);
+  if Length(Wide) = 0 then
   begin
-    Result := Data;   // validated as UTF-8, so this should never happen
+    Result := Data;
     Exit;
   end;
-  SetLength(Wide, WideLen);
-  MultiByteToWideChar(CP_UTF8, 0, PAnsiChar(Data), Length(Data),
-    PWideChar(Wide), WideLen);
 
-  // UTF-16 -> host ANSI code page (CP_ACP), flagging any lossy replacement.
-  AnsiLen := WideCharToMultiByte(CP_ACP, 0, PWideChar(Wide), WideLen,
+  // Unicode -> host ANSI code page (CP_ACP), flagging any lossy replacement.
+  AnsiLen := WideCharToMultiByte(CP_ACP, 0, PWideChar(Wide), Length(Wide),
     nil, 0, nil, nil);
   if AnsiLen <= 0 then
   begin
@@ -168,7 +258,7 @@ begin
   end;
   SetLength(Result, AnsiLen);
   UsedDefault := False;
-  WideCharToMultiByte(CP_ACP, 0, PWideChar(Wide), WideLen,
+  WideCharToMultiByte(CP_ACP, 0, PWideChar(Wide), Length(Wide),
     PAnsiChar(Result), AnsiLen, nil, @UsedDefault);
   Lossy := UsedDefault;
 end;

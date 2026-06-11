@@ -14,7 +14,7 @@ program TestUnwrap;
 {$mode objfpc}{$H+}
 
 uses
-  SysUtils, UnwrapCore, BodyExtract;
+  SysUtils, Classes, UnwrapCore, BodyExtract;
 
 {$I Golden.inc}
 
@@ -75,6 +75,46 @@ begin
   end;
 end;
 
+procedure TestPreservePlain;
+// A plain (non-wrapped) package spec sitting next to a wrapped body: the
+// wrapped block must be located precisely so the caller can swap it in place
+// and keep the spec. Verifies the region span, not the rebuilt window text.
+var
+  Ddl: AnsiString;
+  Lines: TStringList;
+  Regions: TWrapRegionArray;
+  Ok: Boolean;
+  I: Integer;
+begin
+  Ddl := 'CREATE OR REPLACE PACKAGE demo AS'#10
+       + '  PROCEDURE foo;'#10
+       + 'END demo;'#10
+       + '/'#10
+       + 'CREATE OR REPLACE PACKAGE BODY demo wrapped'#10
+       + 'a000000'#10'1'#10;
+  for I := 1 to 15 do
+    Ddl := Ddl + 'abcd'#10;
+  Ddl := Ddl + '8'#10'3d 71'#10 + GOLDEN_B64 + #10'/'#10;
+
+  Lines := TStringList.Create;
+  try
+    Lines.Text := Ddl;
+    Regions := FindWrapRegions(Lines);
+    Check('preserve_region_count', Length(Regions) = 1);
+    Check('preserve_header_is_wrapped_create',
+      (Length(Regions) = 1) and
+      (Pos('package body demo', LowerCase(Lines[Regions[0].HeadLine])) > 0));
+    Check('preserve_spec_outside_region',
+      (Length(Regions) = 1) and (Regions[0].HeadLine >= 4) and
+      (Pos('package demo as', LowerCase(Lines[0])) > 0));
+    Check('preserve_body_decodes',
+      (Length(Regions) = 1) and
+      (DecodeBody(Regions[0].Body, True, Ok) = GOLDEN_SOURCE));
+  finally
+    Lines.Free;
+  end;
+end;
+
 procedure TestNotWrapped;
 begin
   try
@@ -95,6 +135,22 @@ begin
     on E: EUnwrapError do
       Check('legacy_kind', E.Kind = uekLegacy);
   end;
+end;
+
+procedure TestCharsetDetect;
+var
+  IsoBytes, CpBytes, Utf8Bytes: AnsiString;
+begin
+  // 'Это секретный код' as raw source bytes in three encodings. The ISO-8859-5
+  // and cp1251 byte streams BOTH decode to valid Cyrillic — only the frequency
+  // heuristic tells which is real Russian. (ACP-independent: we check the
+  // inferred source code page, not the final host-ANSI bytes.)
+  IsoBytes  := #$CD#$E2#$DE#$20#$E1#$D5#$DA#$E0#$D5#$E2#$DD#$EB#$D9#$20#$DA#$DE#$D4;
+  CpBytes   := #$DD#$F2#$EE#$20#$F1#$E5#$EA#$F0#$E5#$F2#$ED#$FB#$E9#$20#$EA#$EE#$E4;
+  Utf8Bytes := #$D0#$AD#$D1#$82#$D0#$BE;  // 'Это' in UTF-8
+  Check('detect_iso8859p5', InferSourceCodePage(IsoBytes) = 28595);
+  Check('detect_cp1251',    InferSourceCodePage(CpBytes) = 1251);
+  Check('detect_utf8',      InferSourceCodePage(Utf8Bytes) = 65001);
 end;
 
 procedure TestSha1Tamper;
@@ -121,8 +177,10 @@ begin
   WriteLn('TestUnwrap (native core)');
   TestGoldenVector;
   TestGoldenViaExtract;
+  TestPreservePlain;
   TestNotWrapped;
   TestLegacyStub;
+  TestCharsetDetect;
   TestSha1Tamper;
   WriteLn;
   if Failures = 0 then
