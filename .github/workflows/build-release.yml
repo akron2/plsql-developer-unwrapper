@@ -18,6 +18,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Pinned toolchain. The 32-bit Lazarus distribution ships an i386-win32 FPC
+# (native ppc386, builds the 32-bit DLL) bundled with the x86_64-win64 cross
+# compiler (ppcrossx64, builds the 64-bit DLL) -- one install covers both.
+# Bump these two together (folder name + filename) to move FPC/Lazarus forward.
+env:
+  LAZ_VERSION: "3.2"
+  FPC_VERSION: "3.2.2"
+
 jobs:
   build:
     runs-on: windows-latest
@@ -26,17 +34,40 @@ jobs:
         uses: actions/checkout@v4
 
       # gen_charmap.py runs in verify mode here (no app/unwrap.py in this repo),
-      # so Python is only needed to validate the committed includes.
+      # so Python only validates the committed includes.
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
-      # Provides fpc with both x86_64-win64 and i386-win32 targets on Windows.
-      - name: Set up Lazarus + Free Pascal
-        uses: gcarreno/setup-lazarus@v3
-        with:
-          lazarus-version: stable
+      - name: Install Lazarus 32-bit (FPC i386-win32 + win64 cross)
+        shell: pwsh
+        run: |
+          $file = "lazarus-$env:LAZ_VERSION-fpc-$env:FPC_VERSION-win32.exe"
+          $url  = "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2032%20bits/Lazarus%20$env:LAZ_VERSION/$file/download"
+          $exe  = Join-Path $env:RUNNER_TEMP "lazarus-setup.exe"
+          $ok = $false
+          for ($i = 1; $i -le 3; $i++) {
+            try {
+              Write-Host "Download attempt $i : $url"
+              Invoke-WebRequest -Uri $url -OutFile $exe -MaximumRedirection 10 -UseBasicParsing
+              if ((Get-Item $exe).Length -gt 100MB) { $ok = $true; break }
+              Write-Host "Downloaded file too small ($((Get-Item $exe).Length) bytes) -- retrying."
+            } catch { Write-Host "attempt $i failed: $_" }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $ok) { throw "Failed to download Lazarus installer from SourceForge." }
+          # Silent InnoSetup install; this also writes a working fpc.cfg.
+          Start-Process -FilePath $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\Lazarus' -Wait
+          $fpcBin = "C:\Lazarus\fpc\$env:FPC_VERSION\bin\i386-win32"
+          if (-not (Test-Path (Join-Path $fpcBin 'ppc386.exe'))) { throw "ppc386.exe not found in $fpcBin after install." }
+          if (-not (Test-Path (Join-Path $fpcBin 'ppcrossx64.exe'))) { throw "ppcrossx64.exe (win64 cross) not found in $fpcBin." }
+          "C:\Lazarus"  | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $fpcBin       | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Show FPC version
+        shell: cmd
+        run: fpc -iV & fpc -iTP
 
       # Gate: TestUnwrap.exe sets ExitCode=1 on any failure -> step fails.
       - name: Run native tests
@@ -51,7 +82,7 @@ jobs:
         shell: cmd
         run: build\build32.bat
 
-      # Always keep the binaries downloadable from the run (90-day retention).
+      # Always keep the binaries downloadable from the run.
       - name: Upload DLL artifacts
         uses: actions/upload-artifact@v4
         with:
