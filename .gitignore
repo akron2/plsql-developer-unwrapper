@@ -1,0 +1,11 @@
+# Build artifacts
+dist/
+tests/build/
+
+# FPC intermediates
+*.o
+*.ppu
+*.compiled
+*.or
+*.a
+*.exe
