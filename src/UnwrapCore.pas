@@ -40,14 +40,19 @@ type
 
 { Decode a single base64 wrap body into source text.
   Sha1Ok reports whether the embedded SHA-1 matched the stream, regardless of
-  Verify. When Verify is True a mismatch raises EUnwrapError(uekIntegrity). }
+  Verify. When Verify is True a mismatch raises EUnwrapError(uekIntegrity).
+  Lossy reports whether any source character had no representation in the host
+  ANSI code page and was replaced with '?' — an inherent limit of the ANSI
+  (char*) plug-in API, surfaced so the caller can warn the user. }
 function DecodeBody(const B64Body: AnsiString; Verify: Boolean;
-  out Sha1Ok: Boolean): AnsiString;
+  out Sha1Ok: Boolean; out Lossy: Boolean): AnsiString; overload;
+function DecodeBody(const B64Body: AnsiString; Verify: Boolean;
+  out Sha1Ok: Boolean): AnsiString; overload;
 
 implementation
 
 uses
-  Classes, base64, sha1, zstream;
+  Classes, base64, sha1, zstream, Windows;
 
 {$I Charmap.inc}
 
@@ -112,17 +117,60 @@ begin
   Result := True;
 end;
 
-{ Decode source bytes, tolerating non-UTF-8 database character sets.
-  Mirrors Python's utf-8 -> cp1251 -> latin-1 chain for an ANSI host:
-  valid UTF-8 is converted to the system ANSI code page (cp1251 on a Russian
-  Windows); otherwise the bytes are already in an 8-bit code page and pass
-  through unchanged (latin-1 is the lossless last resort). }
-function DecodeText(const Data: AnsiString): AnsiString;
+{ Decode source bytes, tolerating non-UTF-8 database character sets, and report
+  whether the conversion lost any character.
+
+  Mirrors Python's utf-8 -> cp1251 -> latin-1 chain for an ANSI host: valid
+  UTF-8 is converted to the host ANSI code page (cp1251 on a Russian Windows)
+  explicitly through the Win32 API — deterministic and independent of the FPC
+  widestring manager that Utf8ToAnsi would otherwise rely on (whose state in a
+  DLL is fragile and could mangle Cyrillic). Non-UTF-8 bytes are already in an
+  8-bit code page and pass through unchanged (the lossless last resort).
+
+  Lossy is set when a character had no representation in the host code page and
+  was replaced with '?'. That cannot be avoided here (the plug-in API hands the
+  IDE a char*), but it is reported instead of corrupting data silently. }
+function DecodeText(const Data: AnsiString; out Lossy: Boolean): AnsiString;
+var
+  Wide: UnicodeString;
+  WideLen, AnsiLen: Integer;
+  UsedDefault: LongBool;
 begin
-  if IsValidUtf8(Data) then
-    Result := Utf8ToAnsi(Data)   // ASCII stays ASCII; multibyte -> ANSI
-  else
+  Lossy := False;
+  if Length(Data) = 0 then
+    Exit('');
+
+  if not IsValidUtf8(Data) then
+  begin
+    // Already an 8-bit DB code page (e.g. CL8MSWIN1251) — pass through, lossless.
     Result := Data;
+    Exit;
+  end;
+
+  // UTF-8 -> UTF-16.
+  WideLen := MultiByteToWideChar(CP_UTF8, 0, PAnsiChar(Data), Length(Data), nil, 0);
+  if WideLen <= 0 then
+  begin
+    Result := Data;   // validated as UTF-8, so this should never happen
+    Exit;
+  end;
+  SetLength(Wide, WideLen);
+  MultiByteToWideChar(CP_UTF8, 0, PAnsiChar(Data), Length(Data),
+    PWideChar(Wide), WideLen);
+
+  // UTF-16 -> host ANSI code page (CP_ACP), flagging any lossy replacement.
+  AnsiLen := WideCharToMultiByte(CP_ACP, 0, PWideChar(Wide), WideLen,
+    nil, 0, nil, nil);
+  if AnsiLen <= 0 then
+  begin
+    Result := Data;
+    Exit;
+  end;
+  SetLength(Result, AnsiLen);
+  UsedDefault := False;
+  WideCharToMultiByte(CP_ACP, 0, PWideChar(Wide), WideLen,
+    PAnsiChar(Result), AnsiLen, nil, @UsedDefault);
+  Lossy := UsedDefault;
 end;
 
 { Inflate a zlib stream (with header), unknown output size. }
@@ -162,13 +210,14 @@ begin
 end;
 
 function DecodeBody(const B64Body: AnsiString; Verify: Boolean;
-  out Sha1Ok: Boolean): AnsiString;
+  out Sha1Ok: Boolean; out Lossy: Boolean): AnsiString;
 var
   Compact, Raw, Buffer, Stored, Stream, Data: AnsiString;
   I, N: Integer;
   Digest: TSHA1Digest;
 begin
   Sha1Ok := False;
+  Lossy := False;
 
   Compact := StripWhitespace(B64Body);
   Raw := DecodeStringBase64(Compact);
@@ -208,7 +257,15 @@ begin
   if (Length(Data) > 0) and (Data[Length(Data)] = #0) then
     SetLength(Data, Length(Data) - 1);
 
-  Result := DecodeText(Data);
+  Result := DecodeText(Data, Lossy);
+end;
+
+function DecodeBody(const B64Body: AnsiString; Verify: Boolean;
+  out Sha1Ok: Boolean): AnsiString;
+var
+  IgnoredLossy: Boolean;
+begin
+  Result := DecodeBody(B64Body, Verify, Sha1Ok, IgnoredLossy);
 end;
 
 end.
