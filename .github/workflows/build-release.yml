@@ -44,13 +44,15 @@ jobs:
         shell: pwsh
         run: |
           $file = "lazarus-$env:LAZ_VERSION-fpc-$env:FPC_VERSION-win32.exe"
-          $url  = "https://sourceforge.net/projects/lazarus/files/Lazarus%20Windows%2032%20bits/Lazarus%20$env:LAZ_VERSION/$file/download"
+          # downloads.sourceforge.net/project/... redirects straight to a mirror
+          # serving the binary (the /files/.../download page is an HTML stub).
+          $url  = "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2032%20bits/Lazarus%20$env:LAZ_VERSION/$file"
           $exe  = Join-Path $env:RUNNER_TEMP "lazarus-setup.exe"
           $ok = $false
           for ($i = 1; $i -le 3; $i++) {
             try {
               Write-Host "Download attempt $i : $url"
-              Invoke-WebRequest -Uri $url -OutFile $exe -MaximumRedirection 10 -UseBasicParsing
+              Invoke-WebRequest -Uri $url -OutFile $exe -MaximumRedirection 10 -UseBasicParsing -UserAgent 'Mozilla/5.0'
               if ((Get-Item $exe).Length -gt 100MB) { $ok = $true; break }
               Write-Host "Downloaded file too small ($((Get-Item $exe).Length) bytes) -- retrying."
             } catch { Write-Host "attempt $i failed: $_" }
