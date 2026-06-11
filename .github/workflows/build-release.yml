@@ -44,21 +44,28 @@ jobs:
         shell: pwsh
         run: |
           $file = "lazarus-$env:LAZ_VERSION-fpc-$env:FPC_VERSION-win32.exe"
-          # downloads.sourceforge.net/project/... redirects straight to a mirror
-          # serving the binary (the /files/.../download page is an HTML stub).
-          $url  = "https://downloads.sourceforge.net/project/lazarus/Lazarus%20Windows%2032%20bits/Lazarus%20$env:LAZ_VERSION/$file"
-          $exe  = Join-Path $env:RUNNER_TEMP "lazarus-setup.exe"
+          $path = "project/lazarus/Lazarus%20Windows%2032%20bits/Lazarus%20$env:LAZ_VERSION/$file"
+          # downloads.sourceforge.net is behind a Cloudflare challenge for scripted
+          # clients; the per-mirror *.dl.sourceforge.net hosts serve the file directly.
+          $mirrors = @(
+            "https://master.dl.sourceforge.net/$path?viasf=1",
+            "https://netix.dl.sourceforge.net/$path?viasf=1",
+            "https://phoenixnap.dl.sourceforge.net/$path?viasf=1",
+            "https://gigenet.dl.sourceforge.net/$path?viasf=1",
+            "https://netcologne.dl.sourceforge.net/$path?viasf=1"
+          )
+          $exe = Join-Path $env:RUNNER_TEMP "lazarus-setup.exe"
           $ok = $false
-          for ($i = 1; $i -le 3; $i++) {
+          foreach ($url in $mirrors) {
             try {
-              Write-Host "Download attempt $i : $url"
+              Write-Host "Trying $url"
               Invoke-WebRequest -Uri $url -OutFile $exe -MaximumRedirection 10 -UseBasicParsing -UserAgent 'Mozilla/5.0'
-              if ((Get-Item $exe).Length -gt 100MB) { $ok = $true; break }
-              Write-Host "Downloaded file too small ($((Get-Item $exe).Length) bytes) -- retrying."
-            } catch { Write-Host "attempt $i failed: $_" }
-            Start-Sleep -Seconds 10
+              $len = (Get-Item $exe).Length
+              if ($len -gt 100MB) { Write-Host "  OK ($len bytes)"; $ok = $true; break }
+              Write-Host "  too small ($len bytes)"
+            } catch { Write-Host "  failed: $($_.Exception.Message)" }
           }
-          if (-not $ok) { throw "Failed to download Lazarus installer from SourceForge." }
+          if (-not $ok) { throw "Failed to download Lazarus installer from any SourceForge mirror." }
           # Silent InnoSetup install; this also writes a working fpc.cfg.
           Start-Process -FilePath $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\Lazarus' -Wait
           $fpcBin = "C:\Lazarus\fpc\$env:FPC_VERSION\bin\i386-win32"
