@@ -18,10 +18,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Pinned toolchain. The 32-bit Lazarus distribution ships an i386-win32 FPC
-# (native ppc386, builds the 32-bit DLL) bundled with the x86_64-win64 cross
-# compiler (ppcrossx64, builds the 64-bit DLL) -- one install covers both.
-# Bump these two together (folder name + filename) to move FPC/Lazarus forward.
+# Pinned 32-bit toolchain (the i386-win32 FPC that builds the 32-bit DLL).
+# The 64-bit FPC comes from setup-lazarus. Each compiler builds its own native
+# target -- no cross-compilers, because neither distribution ships the other's.
+# Bump both together (folder name + filename) to move FPC/Lazarus forward.
 env:
   LAZ_VERSION: "3.2"
   FPC_VERSION: "3.2.2"
@@ -40,16 +40,24 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Install Lazarus 32-bit (FPC i386-win32 + win64 cross)
+      # Provides the x86_64-win64 FPC (ppcx64) used for the 64-bit DLL and tests.
+      - name: Set up Lazarus + FPC (x86_64)
+        uses: gcarreno/setup-lazarus@v3
+        with:
+          lazarus-version: stable
+
+      # Provides the i386-win32 FPC (ppc386) used for the 32-bit DLL. Installed
+      # to its own dir and exposed via FPC_I386_BIN; NOT put on the global PATH,
+      # so it doesn't shadow the x86_64 compiler used by the steps above/below.
+      - name: Install FPC i386-win32 (for the 32-bit DLL)
         shell: pwsh
         run: |
           $file = "lazarus-$env:LAZ_VERSION-fpc-$env:FPC_VERSION-win32.exe"
           $path = "project/lazarus/Lazarus%20Windows%2032%20bits/Lazarus%20$env:LAZ_VERSION/$file"
           # downloads.sourceforge.net is behind a Cloudflare challenge for scripted
-          # clients; the per-mirror *.dl.sourceforge.net hosts serve the file directly.
-          # ${path} braces are required so the '?' starts the query, not the var name.
-          # master.dl serves the binary directly; others are fallbacks (the size
-          # check below rejects any that answer with an HTML stub).
+          # clients; the master.dl mirror serves the binary directly. ${path} braces
+          # are required so '?' starts the query rather than extending the var name.
+          # The size check rejects any mirror that answers with an HTML stub.
           $mirrors = @(
             "https://master.dl.sourceforge.net/${path}?viasf=1",
             "https://phoenixnap.dl.sourceforge.net/${path}?viasf=1",
@@ -68,19 +76,21 @@ jobs:
           }
           if (-not $ok) { throw "Failed to download Lazarus installer from any SourceForge mirror." }
           # Silent InnoSetup install; this also writes a working fpc.cfg.
-          Start-Process -FilePath $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\Lazarus' -Wait
-          $fpcBin = "C:\Lazarus\fpc\$env:FPC_VERSION\bin\i386-win32"
+          Start-Process -FilePath $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\Lazarus32' -Wait
+          $fpcBin = "C:\Lazarus32\fpc\$env:FPC_VERSION\bin\i386-win32"
           if (-not (Test-Path (Join-Path $fpcBin 'ppc386.exe'))) { throw "ppc386.exe not found in $fpcBin after install." }
-          if (-not (Test-Path (Join-Path $fpcBin 'ppcrossx64.exe'))) { throw "ppcrossx64.exe (win64 cross) not found in $fpcBin." }
-          "C:\Lazarus"  | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          $fpcBin       | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "FPC_I386_BIN=$fpcBin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Show FPC version
+      - name: Show toolchains
         shell: cmd
-        run: fpc -iV & fpc -iTP
+        run: |
+          echo == x86_64 ==
+          fpc -iV
+          echo == i386 ==
+          "%FPC_I386_BIN%\fpc.exe" -iV
 
       # Gate: TestUnwrap.exe sets ExitCode=1 on any failure -> step fails.
-      - name: Run native tests
+      - name: Run native tests (x86_64)
         shell: cmd
         run: tests\runtests.bat
 
@@ -90,7 +100,10 @@ jobs:
 
       - name: Build 32-bit DLL
         shell: cmd
-        run: build\build32.bat
+        run: |
+          set "PATH=%FPC_I386_BIN%;%PATH%"
+          call build\build32.bat
+          if errorlevel 1 exit /b 1
 
       # Always keep the binaries downloadable from the run.
       - name: Upload DLL artifacts
