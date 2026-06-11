@@ -1,0 +1,73 @@
+name: build-release
+
+# Push to main           -> build both DLLs + run native tests (no release).
+# Push a tag like v1.2.3 -> same, then publish a GitHub Release with the DLLs.
+# Manual run (Actions UI) -> build + tests on demand.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+# action-gh-release needs write access to create the release.
+permissions:
+  contents: write
+
+# Don't pile up runs on rapid pushes to the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # gen_charmap.py runs in verify mode here (no app/unwrap.py in this repo),
+      # so Python is only needed to validate the committed includes.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      # Provides fpc with both x86_64-win64 and i386-win32 targets on Windows.
+      - name: Set up Lazarus + Free Pascal
+        uses: gcarreno/setup-lazarus@v3
+        with:
+          lazarus-version: stable
+
+      # Gate: TestUnwrap.exe sets ExitCode=1 on any failure -> step fails.
+      - name: Run native tests
+        shell: cmd
+        run: tests\runtests.bat
+
+      - name: Build 64-bit DLL
+        shell: cmd
+        run: build\build64.bat
+
+      - name: Build 32-bit DLL
+        shell: cmd
+        run: build\build32.bat
+
+      # Always keep the binaries downloadable from the run (90-day retention).
+      - name: Upload DLL artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: PLSQLUnwrap-dll
+          path: |
+            dist/PLSQLUnwrap64.dll
+            dist/PLSQLUnwrap32.dll
+          if-no-files-found: error
+
+      # Only on a v* tag: attach the DLLs to a Release for that version.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/PLSQLUnwrap64.dll
+            dist/PLSQLUnwrap32.dll
+          generate_release_notes: true
+          fail_on_unmatched_files: true
