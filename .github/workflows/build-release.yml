@@ -1,11 +1,12 @@
 name: build-release
 
-# Push to main           -> build both DLLs + run native tests (no release).
-# Push a tag like v1.2.3 -> same, then publish a GitHub Release with the DLLs.
-# Manual run (Actions UI) -> build + tests on demand.
+# Push a tag like v1.2.3 -> build both DLLs + run native tests, then publish a
+#                           GitHub Release with the DLLs.
+# Manual run (Actions UI) -> build + tests on demand (no release unless the run
+#                           was dispatched from a v* tag).
+# Plain pushes to main do NOT trigger CI — only tags build.
 on:
   push:
-    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
